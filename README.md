@@ -1,18 +1,18 @@
-# Docker Compose Relay Demo
+# Redis Button Board
 
-This project starts:
+This project now starts only two containers:
 
-- `rabbitmq` on an internal Docker network
-- `worker1`, `worker2`, and `worker3` on the same internal network
+- `redis` on an internal Docker network
 - `orchestrator`, which joins both the internal network and `dokploy-network`
 
-The flow is:
+The web UI runs from the orchestrator container. Clicking UI buttons writes state into Redis on the other container:
 
-1. The orchestrator publishes a message to `stage1`.
-2. `worker1` appends its hostname and forwards to `stage2`.
-3. `worker2` appends its hostname and forwards to `stage3`.
-4. `worker3` appends its hostname and sends the final report back to the orchestrator.
-5. The orchestrator pushes progress to the browser over WebSockets.
+1. `Increment Counter` updates a Redis counter.
+2. `Toggle Mode` flips a Redis-backed mode value.
+3. `Save Note` stores a note in a Redis list.
+4. `Reset Store` clears the Redis-backed UI state.
+
+The orchestrator pushes updated state to connected browsers over WebSockets so every open page reflects the current Redis contents.
 
 ## Run
 

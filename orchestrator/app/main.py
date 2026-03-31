@@ -1,131 +1,29 @@
 import asyncio
 import json
 import os
-from collections import deque
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
 
-import aio_pika
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+from redis.asyncio import Redis
 
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
-START_QUEUE = os.getenv("START_QUEUE", "stage1")
-PROGRESS_QUEUE = os.getenv("PROGRESS_QUEUE", "progress")
-REPORT_QUEUE = os.getenv("REPORT_QUEUE", "orchestrator_reports")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+COUNTER_KEY = "ui:counter"
+MODE_KEY = "ui:mode"
+NOTES_KEY = "ui:notes"
+EVENTS_KEY = "ui:events"
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-class RunStore:
-    def __init__(self) -> None:
-        self._runs: dict[str, dict[str, Any]] = {}
-        self._recent_events: deque[dict[str, Any]] = deque(maxlen=100)
-        self._worker_statuses: dict[str, dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def register_start(self, trace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        event = {
-            "type": "run_started",
-            "trace_id": trace_id,
-            "timestamp": utc_now(),
-            "message": "Orchestrator queued the initial message.",
-            "payload": payload,
-        }
-        async with self._lock:
-            self._runs[trace_id] = {
-                "trace_id": trace_id,
-                "status": "queued",
-                "created_at": event["timestamp"],
-                "completed_at": None,
-                "hops": [],
-                "events": [event],
-                "final_report": None,
-                "message": payload.get("message"),
-            }
-            self._recent_events.appendleft(event)
-            return event
-
-    async def record_progress(self, event: dict[str, Any]) -> None:
-        async with self._lock:
-            if event["type"] == "worker_ready":
-                self._worker_statuses[event["worker"]] = {
-                    "worker": event["worker"],
-                    "hostname": event["hostname"],
-                    "timestamp": event["timestamp"],
-                    "status": "ready",
-                    "queue_message": event["message"],
-                }
-                self._recent_events.appendleft(event)
-                return
-
-            trace_id = event["trace_id"]
-            run = self._runs.setdefault(
-                trace_id,
-                {
-                    "trace_id": trace_id,
-                    "status": "in_progress",
-                    "created_at": event["timestamp"],
-                    "completed_at": None,
-                    "hops": [],
-                    "events": [],
-                    "final_report": None,
-                    "message": None,
-                },
-            )
-            run["status"] = "in_progress"
-            hop = {
-                "worker": event["worker"],
-                "hostname": event["hostname"],
-                "timestamp": event["timestamp"],
-            }
-            run["hops"].append(hop)
-            run["events"].append(event)
-            self._recent_events.appendleft(event)
-
-    async def record_report(self, event: dict[str, Any]) -> None:
-        trace_id = event["trace_id"]
-        async with self._lock:
-            run = self._runs.setdefault(
-                trace_id,
-                {
-                    "trace_id": trace_id,
-                    "status": "completed",
-                    "created_at": event["timestamp"],
-                    "completed_at": event["timestamp"],
-                    "hops": [],
-                    "events": [],
-                    "final_report": None,
-                    "message": None,
-                },
-            )
-            run["status"] = "completed"
-            run["completed_at"] = event["timestamp"]
-            run["final_report"] = event
-            run["events"].append(event)
-            self._recent_events.appendleft(event)
-
-    async def snapshot(self) -> dict[str, Any]:
-        async with self._lock:
-            runs = sorted(
-                self._runs.values(),
-                key=lambda item: item["created_at"],
-                reverse=True,
-            )
-            return {
-                "runs": runs,
-                "events": list(self._recent_events),
-                "workers": sorted(self._worker_statuses.values(), key=lambda item: item["worker"]),
-            }
-
-    async def ready_workers(self) -> set[str]:
-        async with self._lock:
-            return set(self._worker_statuses.keys())
+class NotePayload(BaseModel):
+    text: str
 
 
 class WebSocketHub:
@@ -154,75 +52,118 @@ class WebSocketHub:
                 self._clients.discard(client)
 
 
-class RabbitBridge:
-    def __init__(self, store: RunStore, hub: WebSocketHub) -> None:
-        self.store = store
-        self.hub = hub
-        self.connection: aio_pika.RobustConnection | None = None
-        self.channel: aio_pika.abc.AbstractRobustChannel | None = None
-        self._consumer_tasks: list[asyncio.Task[Any]] = []
+class RedisStore:
+    def __init__(self) -> None:
+        self.redis: Redis | None = None
 
     async def connect(self) -> None:
         while True:
             try:
-                self.connection = await aio_pika.connect_robust(RABBITMQ_URL)
-                self.channel = await self.connection.channel()
-                await self.channel.set_qos(prefetch_count=25)
-                await self.channel.declare_queue(START_QUEUE, durable=True)
-                await self.channel.declare_queue(PROGRESS_QUEUE, durable=True)
-                await self.channel.declare_queue(REPORT_QUEUE, durable=True)
-                self._consumer_tasks = [
-                    asyncio.create_task(self._consume(PROGRESS_QUEUE, self._handle_progress)),
-                    asyncio.create_task(self._consume(REPORT_QUEUE, self._handle_report)),
-                ]
+                self.redis = Redis.from_url(REDIS_URL, decode_responses=True)
+                await self.redis.ping()
+                await self._seed_defaults()
                 return
             except Exception as exc:
-                print(f"RabbitMQ connection failed: {exc}. Retrying in 3s.")
+                print(f"Redis connection failed: {exc}. Retrying in 3s.")
                 await asyncio.sleep(3)
 
     async def close(self) -> None:
-        for task in self._consumer_tasks:
-            task.cancel()
-        if self.connection:
-            await self.connection.close()
+        if self.redis is not None:
+            await self.redis.aclose()
 
-    async def _consume(self, queue_name: str, handler) -> None:
-        assert self.channel is not None
-        queue = await self.channel.declare_queue(queue_name, durable=True)
-        async with queue.iterator() as queue_iter:
-            async for incoming in queue_iter:
-                async with incoming.process():
-                    payload = json.loads(incoming.body.decode())
-                    await handler(payload)
+    async def _seed_defaults(self) -> None:
+        assert self.redis is not None
+        pipe = self.redis.pipeline()
+        pipe.setnx(COUNTER_KEY, 0)
+        pipe.setnx(MODE_KEY, "idle")
+        await pipe.execute()
 
-    async def _handle_progress(self, payload: dict[str, Any]) -> None:
-        await self.store.record_progress(payload)
-        await self.hub.broadcast({"type": "progress", "event": payload})
+    async def snapshot(self) -> dict[str, Any]:
+        assert self.redis is not None
+        pipe = self.redis.pipeline()
+        pipe.get(COUNTER_KEY)
+        pipe.get(MODE_KEY)
+        pipe.lrange(NOTES_KEY, 0, 19)
+        pipe.lrange(EVENTS_KEY, 0, 19)
+        counter, mode, notes, events = await pipe.execute()
+        parsed_events = [json.loads(event) for event in events]
+        return {
+            "counter": int(counter or 0),
+            "mode": mode or "idle",
+            "notes": [json.loads(note) for note in notes],
+            "events": parsed_events,
+        }
 
-    async def _handle_report(self, payload: dict[str, Any]) -> None:
-        await self.store.record_report(payload)
-        await self.hub.broadcast({"type": "report", "event": payload})
+    async def increment_counter(self) -> dict[str, Any]:
+        assert self.redis is not None
+        value = await self.redis.incr(COUNTER_KEY)
+        event = {
+            "type": "counter_incremented",
+            "timestamp": utc_now(),
+            "message": f"Counter incremented to {value}.",
+        }
+        await self._record_event(event)
+        return await self.snapshot()
 
-    async def publish_start(self, payload: dict[str, Any]) -> None:
-        assert self.channel is not None
-        message = aio_pika.Message(
-            body=json.dumps(payload).encode(),
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            content_type="application/json",
-        )
-        await self.channel.default_exchange.publish(message, routing_key=START_QUEUE)
+    async def toggle_mode(self) -> dict[str, Any]:
+        assert self.redis is not None
+        current = await self.redis.get(MODE_KEY)
+        next_mode = "armed" if current != "armed" else "idle"
+        await self.redis.set(MODE_KEY, next_mode)
+        event = {
+            "type": "mode_toggled",
+            "timestamp": utc_now(),
+            "message": f"Mode switched to {next_mode}.",
+        }
+        await self._record_event(event)
+        return await self.snapshot()
+
+    async def save_note(self, text: str) -> dict[str, Any]:
+        assert self.redis is not None
+        clean_text = text.strip()
+        if not clean_text:
+            raise ValueError("Note text cannot be empty.")
+        note = {
+            "text": clean_text,
+            "timestamp": utc_now(),
+        }
+        await self.redis.lpush(NOTES_KEY, json.dumps(note))
+        await self.redis.ltrim(NOTES_KEY, 0, 19)
+        event = {
+            "type": "note_saved",
+            "timestamp": utc_now(),
+            "message": f"Saved note: {clean_text}",
+        }
+        await self._record_event(event)
+        return await self.snapshot()
+
+    async def reset(self) -> dict[str, Any]:
+        assert self.redis is not None
+        await self.redis.delete(COUNTER_KEY, MODE_KEY, NOTES_KEY, EVENTS_KEY)
+        await self._seed_defaults()
+        event = {
+            "type": "store_reset",
+            "timestamp": utc_now(),
+            "message": "Redis-backed UI state was reset.",
+        }
+        await self._record_event(event)
+        return await self.snapshot()
+
+    async def _record_event(self, event: dict[str, Any]) -> None:
+        assert self.redis is not None
+        await self.redis.lpush(EVENTS_KEY, json.dumps(event))
+        await self.redis.ltrim(EVENTS_KEY, 0, 19)
 
 
-store = RunStore()
 hub = WebSocketHub()
-bridge = RabbitBridge(store=store, hub=hub)
+store = RedisStore()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await bridge.connect()
+    await store.connect()
     yield
-    await bridge.close()
+    await store.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -236,16 +177,16 @@ async def index() -> str:
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Message Flow Orchestrator</title>
+    <title>Redis Button Board</title>
     <style>
       :root {
-        --bg: #f4efe7;
-        --panel: rgba(255, 251, 245, 0.92);
-        --ink: #202020;
-        --muted: #5b5b5b;
-        --accent: #0d6b5f;
-        --accent-soft: #d5efe4;
-        --border: rgba(32, 32, 32, 0.12);
+        --bg: #f3efe7;
+        --panel: rgba(255, 253, 247, 0.92);
+        --ink: #1f1f1f;
+        --muted: #626262;
+        --accent: #bf5b2c;
+        --accent-soft: #fde1d3;
+        --border: rgba(31, 31, 31, 0.12);
       }
       * { box-sizing: border-box; }
       body {
@@ -254,9 +195,9 @@ async def index() -> str:
         font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
         color: var(--ink);
         background:
-          radial-gradient(circle at top left, #f6d8b8 0, transparent 28%),
-          radial-gradient(circle at bottom right, #bddfd3 0, transparent 30%),
-          linear-gradient(135deg, #f8f3ea 0%, #ece6dd 100%);
+          radial-gradient(circle at top left, #f8dcb6 0, transparent 26%),
+          radial-gradient(circle at bottom right, #d6e8d3 0, transparent 28%),
+          linear-gradient(135deg, #f7f2e9 0%, #ebe4db 100%);
       }
       main {
         width: min(1120px, calc(100vw - 32px));
@@ -268,8 +209,8 @@ async def index() -> str:
         background: var(--panel);
         backdrop-filter: blur(12px);
         border: 1px solid var(--border);
-        border-radius: 22px;
-        box-shadow: 0 18px 48px rgba(32, 32, 32, 0.08);
+        border-radius: 24px;
+        box-shadow: 0 18px 48px rgba(31, 31, 31, 0.08);
       }
       .hero {
         padding: 28px;
@@ -280,40 +221,34 @@ async def index() -> str:
         display: flex;
         justify-content: space-between;
         gap: 16px;
-        align-items: center;
+        align-items: flex-start;
         flex-wrap: wrap;
       }
       h1 {
         margin: 0;
         font-family: Georgia, "Times New Roman", serif;
-        font-size: clamp(2rem, 3vw, 3.25rem);
+        font-size: clamp(2rem, 3vw, 3.3rem);
         line-height: 0.95;
       }
       p {
         margin: 0;
         color: var(--muted);
       }
-      button {
-        border: 0;
-        border-radius: 999px;
-        padding: 14px 20px;
-        font: inherit;
-        font-weight: 700;
-        cursor: pointer;
-        background: var(--accent);
-        color: white;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-        box-shadow: 0 10px 24px rgba(13, 107, 95, 0.25);
-      }
-      button:hover { transform: translateY(-1px); }
-      .hero-grid {
+      .hero-grid, .content {
         display: grid;
+        gap: 18px;
+      }
+      .hero-grid {
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 12px;
+      }
+      .content {
+        grid-template-columns: 1.1fr 0.9fr;
+      }
+      .metric, .panel {
+        padding: 20px;
       }
       .metric {
-        padding: 14px 16px;
-        border-radius: 18px;
+        border-radius: 20px;
         background: white;
         border: 1px solid var(--border);
       }
@@ -324,67 +259,59 @@ async def index() -> str:
         margin-bottom: 6px;
       }
       .metric strong {
-        font-size: 1.45rem;
-      }
-      .content {
-        display: grid;
-        grid-template-columns: 1.1fr 0.9fr;
-        gap: 18px;
-      }
-      .panel {
-        padding: 20px;
+        font-size: 1.6rem;
       }
       .panel h2 {
         margin: 0 0 14px;
         font-size: 1rem;
-        text-transform: uppercase;
         letter-spacing: 0.08em;
+        text-transform: uppercase;
       }
-      .run-list, .event-list {
+      .action-grid, .list-grid {
         display: grid;
         gap: 12px;
       }
-      .run-card, .event-card {
+      .action-grid {
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      }
+      .button {
+        border: 0;
+        border-radius: 18px;
+        padding: 16px;
+        background: var(--accent);
+        color: white;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        box-shadow: 0 10px 24px rgba(191, 91, 44, 0.24);
+      }
+      .button.secondary {
+        background: #234d44;
+        box-shadow: 0 10px 24px rgba(35, 77, 68, 0.22);
+      }
+      .button.ghost {
+        background: #ffffff;
+        color: var(--ink);
+        border: 1px solid var(--border);
+        box-shadow: none;
+      }
+      textarea {
+        width: 100%;
+        min-height: 110px;
+        resize: vertical;
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        padding: 14px;
+        font: inherit;
+        background: #fff;
+      }
+      .list-card {
         border: 1px solid var(--border);
         border-radius: 18px;
         padding: 14px;
         background: white;
       }
-      .run-header, .event-header {
-        display: flex;
-        justify-content: space-between;
-        gap: 12px;
-        align-items: baseline;
-        flex-wrap: wrap;
-      }
-      .pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        border-radius: 999px;
-        background: var(--accent-soft);
-        color: var(--accent);
-        font-size: 0.82rem;
-        font-weight: 700;
-      }
-      .hops {
-        margin-top: 12px;
-        display: flex;
-        gap: 10px;
-        flex-wrap: wrap;
-      }
-      .hop {
-        min-width: 120px;
-        border-radius: 14px;
-        padding: 10px 12px;
-        background: #f7f7f7;
-      }
-      .hop strong {
-        display: block;
-        margin-bottom: 4px;
-      }
-      .hop code, .run-card code, .event-card code {
+      .list-card code {
         font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
         font-size: 0.83rem;
       }
@@ -405,15 +332,14 @@ async def index() -> str:
       <section class="hero">
         <div class="hero-top">
           <div>
-            <h1>Internal Container Message Relay</h1>
-            <p>Worker 1 -> Worker 2 -> Worker 3 -> Orchestrator, all over RabbitMQ on the internal Docker network.</p>
+            <h1>Redis Button Board</h1>
+            <p>The web UI lives in the orchestrator container. Every action writes state into Redis on the second container.</p>
           </div>
-          <button id="start-run">Start New Run</button>
         </div>
         <div class="hero-grid">
           <article class="metric">
-            <span>Broker</span>
-            <strong>RabbitMQ</strong>
+            <span>Data Store</span>
+            <strong>Redis</strong>
           </article>
           <article class="metric">
             <span>Realtime Channel</span>
@@ -423,40 +349,58 @@ async def index() -> str:
             <span>External Network</span>
             <strong>dokploy-network</strong>
           </article>
-          <article class="metric">
-            <span>Workers Ready</span>
-            <strong id="worker-count">0 / 3</strong>
-          </article>
         </div>
       </section>
       <section class="content">
         <section class="panel">
-          <h2>Worker Status</h2>
-          <div id="workers" class="run-list"></div>
+          <h2>Actions</h2>
+          <div class="action-grid">
+            <button id="increment-button" class="button">Increment Counter</button>
+            <button id="toggle-button" class="button secondary">Toggle Mode</button>
+            <button id="reset-button" class="button ghost">Reset Store</button>
+          </div>
+          <div style="margin-top: 14px;">
+            <textarea id="note-text" placeholder="Write a note that will be stored in Redis..."></textarea>
+          </div>
+          <div style="margin-top: 14px;">
+            <button id="save-note-button" class="button">Save Note</button>
+          </div>
         </section>
         <section class="panel">
-          <h2>Runs</h2>
-          <div id="runs" class="run-list"></div>
+          <h2>Current State</h2>
+          <div class="list-grid">
+            <article class="list-card">
+              <strong>Counter</strong>
+              <p id="counter-value">0</p>
+            </article>
+            <article class="list-card">
+              <strong>Mode</strong>
+              <p id="mode-value">idle</p>
+            </article>
+          </div>
         </section>
         <section class="panel">
-          <h2>Live Event Stream</h2>
-          <div id="events" class="event-list"></div>
+          <h2>Stored Notes</h2>
+          <div id="notes" class="list-grid"></div>
+        </section>
+        <section class="panel">
+          <h2>Activity Log</h2>
+          <div id="events" class="list-grid"></div>
         </section>
       </section>
     </main>
     <script>
-      const workersEl = document.getElementById("workers");
-      const runsEl = document.getElementById("runs");
+      const incrementButton = document.getElementById("increment-button");
+      const toggleButton = document.getElementById("toggle-button");
+      const resetButton = document.getElementById("reset-button");
+      const saveNoteButton = document.getElementById("save-note-button");
+      const noteText = document.getElementById("note-text");
+      const counterValue = document.getElementById("counter-value");
+      const modeValue = document.getElementById("mode-value");
+      const notesEl = document.getElementById("notes");
       const eventsEl = document.getElementById("events");
-      const startButton = document.getElementById("start-run");
-      const workerCountEl = document.getElementById("worker-count");
 
-      const state = { runs: [], events: [], workers: [] };
       let pingTimer = null;
-
-      function fmt(ts) {
-        return new Date(ts).toLocaleString();
-      }
 
       function escapeHtml(value) {
         return String(value)
@@ -467,173 +411,60 @@ async def index() -> str:
           .replaceAll("'", "&#39;");
       }
 
-      function renderWorkers() {
-        workerCountEl.textContent = `${state.workers.length} / 3`;
-        startButton.disabled = state.workers.length < 3;
-        if (!state.workers.length) {
-          workersEl.innerHTML = '<div class="placeholder">No workers have announced readiness yet.</div>';
-          return;
-        }
-        workersEl.innerHTML = state.workers.map((worker) => `
-          <article class="run-card">
-            <div class="run-header">
-              <div>
-                <strong>${escapeHtml(worker.worker)}</strong>
-                <p>${escapeHtml(worker.queue_message)}</p>
-              </div>
-              <span class="pill">${escapeHtml(worker.status)}</span>
-            </div>
-            <p><code>${escapeHtml(worker.hostname)}</code></p>
-            <p>Ready at ${fmt(worker.timestamp)}</p>
-          </article>
-        `).join("");
+      function fmt(ts) {
+        return new Date(ts).toLocaleString();
       }
 
-      function renderRuns() {
-        if (!state.runs.length) {
-          runsEl.innerHTML = '<div class="placeholder">No relay has been started yet.</div>';
-          return;
-        }
-        runsEl.innerHTML = state.runs.map((run) => {
-          const hops = run.hops.map((hop) => `
-            <div class="hop">
-              <strong>${escapeHtml(hop.worker)}</strong>
-              <code>${escapeHtml(hop.hostname)}</code>
-              <div>${fmt(hop.timestamp)}</div>
-            </div>
+      function render(snapshot) {
+        counterValue.textContent = snapshot.counter;
+        modeValue.textContent = snapshot.mode;
+
+        if (!snapshot.notes.length) {
+          notesEl.innerHTML = '<div class="placeholder">No notes stored in Redis yet.</div>';
+        } else {
+          notesEl.innerHTML = snapshot.notes.map((note) => `
+            <article class="list-card">
+              <p>${escapeHtml(note.text)}</p>
+              <code>${fmt(note.timestamp)}</code>
+            </article>
           `).join("");
-          const finalReport = run.final_report
-            ? `<p><strong>Final path:</strong> <code>${escapeHtml(run.final_report.path.join(" -> "))}</code></p>`
-            : '<p><strong>Final path:</strong> waiting for worker3 report</p>';
-          return `
-            <article class="run-card">
-              <div class="run-header">
-                <div>
-                  <strong>${escapeHtml(run.trace_id)}</strong>
-                  <p>${escapeHtml(run.message || "No message body")}</p>
-                </div>
-                <span class="pill">${escapeHtml(run.status)}</span>
-              </div>
-              <p>Started ${fmt(run.created_at)}</p>
-              ${finalReport}
-              <div class="hops">${hops || '<div class="placeholder">Waiting for workers...</div>'}</div>
-            </article>
-          `;
-        }).join("");
-      }
-
-      function renderEvents() {
-        if (!state.events.length) {
-          eventsEl.innerHTML = '<div class="placeholder">Waiting for broker events.</div>';
-          return;
         }
-        eventsEl.innerHTML = state.events.map((event) => {
-          const workerInfo = event.worker
-            ? `<p><strong>${escapeHtml(event.worker)}</strong> on <code>${escapeHtml(event.hostname)}</code></p>`
-            : "";
-          const pathInfo = event.path
-            ? `<p><code>${escapeHtml(event.path.join(" -> "))}</code></p>`
-            : "";
-          return `
-            <article class="event-card">
-              <div class="event-header">
-                <strong>${escapeHtml(event.type)}</strong>
-                <span>${fmt(event.timestamp)}</span>
-              </div>
-              <p>Trace <code>${escapeHtml(event.trace_id)}</code></p>
-              ${workerInfo}
-              ${pathInfo}
+
+        if (!snapshot.events.length) {
+          eventsEl.innerHTML = '<div class="placeholder">No Redis write activity yet.</div>';
+        } else {
+          eventsEl.innerHTML = snapshot.events.map((event) => `
+            <article class="list-card">
+              <strong>${escapeHtml(event.type)}</strong>
               <p>${escapeHtml(event.message)}</p>
+              <code>${fmt(event.timestamp)}</code>
             </article>
-          `;
-        }).join("");
-      }
-
-      function applySnapshot(snapshot) {
-        state.runs = snapshot.runs || [];
-        state.events = snapshot.events || [];
-        state.workers = snapshot.workers || [];
-        renderWorkers();
-        renderRuns();
-        renderEvents();
-      }
-
-      function upsertRunFromEvent(event) {
-        if (event.type === "worker_ready") {
-          const existingWorker = state.workers.find((worker) => worker.worker === event.worker);
-          if (existingWorker) {
-            existingWorker.hostname = event.hostname;
-            existingWorker.timestamp = event.timestamp;
-            existingWorker.status = "ready";
-            existingWorker.queue_message = event.message;
-          } else {
-            state.workers.push({
-              worker: event.worker,
-              hostname: event.hostname,
-              timestamp: event.timestamp,
-              status: "ready",
-              queue_message: event.message,
-            });
-            state.workers.sort((a, b) => a.worker.localeCompare(b.worker));
-          }
-          return;
-        }
-
-        const existing = state.runs.find((run) => run.trace_id === event.trace_id);
-        if (!existing) {
-          state.runs.unshift({
-            trace_id: event.trace_id,
-            status: event.type === "run_started" ? "queued" : (event.type === "final_report" ? "completed" : "in_progress"),
-            created_at: event.timestamp,
-            completed_at: event.type === "final_report" ? event.timestamp : null,
-            hops: [],
-            events: [],
-            final_report: null,
-            message: event.original_message || event.payload?.message || null,
-          });
-        }
-        const run = state.runs.find((item) => item.trace_id === event.trace_id);
-        if (event.type === "worker_progress") {
-          run.status = "in_progress";
-          run.hops.push({
-            worker: event.worker,
-            hostname: event.hostname,
-            timestamp: event.timestamp,
-          });
-        }
-        if (event.type === "final_report") {
-          run.status = "completed";
-          run.completed_at = event.timestamp;
-          run.final_report = event;
-        }
-        if (event.type === "run_started") {
-          run.status = "queued";
-          run.message = event.payload?.message || run.message;
+          `).join("");
         }
       }
 
-      async function loadSnapshot() {
+      async function fetchState() {
         const response = await fetch("/api/state");
-        const snapshot = await response.json();
-        applySnapshot(snapshot);
+        render(await response.json());
       }
 
-      async function startRun() {
-        if (state.workers.length < 3) {
-          return;
+      async function postJson(url, payload) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const error = await response.json();
+          window.alert(error.detail || "Request failed.");
         }
-        startButton.disabled = true;
-        try {
-          const response = await fetch("/api/start", { method: "POST" });
-          if (!response.ok) {
-            const payload = await response.json();
-            const missing = (payload.missing_workers || []).join(", ");
-            window.alert(`Workers not ready: ${missing}`);
-          }
-        } finally {
-          window.setTimeout(() => {
-            startButton.disabled = state.workers.length < 3;
-          }, 500);
+      }
+
+      async function post(url) {
+        const response = await fetch(url, { method: "POST" });
+        if (!response.ok) {
+          const error = await response.json();
+          window.alert(error.detail || "Request failed.");
         }
       }
 
@@ -653,16 +484,7 @@ async def index() -> str:
         socket.addEventListener("message", (raw) => {
           const data = JSON.parse(raw.data);
           if (data.type === "snapshot") {
-            applySnapshot(data.payload);
-            return;
-          }
-          if (data.event) {
-            state.events.unshift(data.event);
-            state.events = state.events.slice(0, 100);
-            upsertRunFromEvent(data.event);
-            renderWorkers();
-            renderRuns();
-            renderEvents();
+            render(data.payload);
           }
         });
         socket.addEventListener("close", () => {
@@ -674,13 +496,15 @@ async def index() -> str:
         });
       }
 
-      startButton.addEventListener("click", startRun);
-
-      loadSnapshot().then(() => {
-        renderWorkers();
-        renderRuns();
-        renderEvents();
+      incrementButton.addEventListener("click", () => post("/api/actions/increment"));
+      toggleButton.addEventListener("click", () => post("/api/actions/toggle"));
+      resetButton.addEventListener("click", () => post("/api/actions/reset"));
+      saveNoteButton.addEventListener("click", async () => {
+        await postJson("/api/notes", { text: noteText.value });
+        noteText.value = "";
       });
+
+      fetchState();
       connect();
     </script>
   </body>
@@ -693,32 +517,35 @@ async def get_state() -> JSONResponse:
     return JSONResponse(await store.snapshot())
 
 
-@app.post("/api/start")
-async def start_run() -> JSONResponse:
-    expected_workers = {"worker1", "worker2", "worker3"}
-    ready_workers = await store.ready_workers()
-    missing_workers = sorted(expected_workers - ready_workers)
-    if missing_workers:
-        return JSONResponse(
-            {
-                "status": "waiting_for_workers",
-                "missing_workers": missing_workers,
-            },
-            status_code=409,
-        )
+@app.post("/api/actions/increment")
+async def increment_counter() -> JSONResponse:
+    snapshot = await store.increment_counter()
+    await hub.broadcast({"type": "snapshot", "payload": snapshot})
+    return JSONResponse(snapshot)
 
-    trace_id = uuid4().hex[:12]
-    payload = {
-        "trace_id": trace_id,
-        "message": "Relay this packet across the internal Docker network.",
-        "path": [],
-        "created_at": utc_now(),
-        "origin": "orchestrator",
-    }
-    event = await store.register_start(trace_id, payload)
-    await hub.broadcast({"type": "run_started", "event": event})
-    await bridge.publish_start(payload)
-    return JSONResponse({"status": "queued", "trace_id": trace_id})
+
+@app.post("/api/actions/toggle")
+async def toggle_mode() -> JSONResponse:
+    snapshot = await store.toggle_mode()
+    await hub.broadcast({"type": "snapshot", "payload": snapshot})
+    return JSONResponse(snapshot)
+
+
+@app.post("/api/actions/reset")
+async def reset_store() -> JSONResponse:
+    snapshot = await store.reset()
+    await hub.broadcast({"type": "snapshot", "payload": snapshot})
+    return JSONResponse(snapshot)
+
+
+@app.post("/api/notes")
+async def save_note(payload: NotePayload) -> JSONResponse:
+    try:
+        snapshot = await store.save_note(payload.text)
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+    await hub.broadcast({"type": "snapshot", "payload": snapshot})
+    return JSONResponse(snapshot)
 
 
 @app.websocket("/ws")

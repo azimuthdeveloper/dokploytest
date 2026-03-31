@@ -1,88 +1,34 @@
 services:
-  rabbitmq:
-    image: rabbitmq:3.13-alpine
-    hostname: rabbitmq
+  redis:
+    image: redis:7-alpine
+    hostname: redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 5s
     networks:
-      - relay-internal
+      - app-internal
 
   orchestrator:
     build:
       context: ./orchestrator
     restart: unless-stopped
     depends_on:
-      rabbitmq:
+      redis:
         condition: service_healthy
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      START_QUEUE: stage1
-      PROGRESS_QUEUE: progress
-      REPORT_QUEUE: orchestrator_reports
+      REDIS_URL: redis://redis:6379/0
     ports:
       - 8080
     networks:
-      - relay-internal
+      - app-internal
       - dokploy-network
 
-  worker1:
-    build:
-      context: ./worker
-    restart: unless-stopped
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      WORKER_NAME: worker1
-      INPUT_QUEUE: stage1
-      OUTPUT_QUEUE: stage2
-      PROGRESS_QUEUE: progress
-      REPORT_QUEUE: orchestrator_reports
-    networks:
-      - relay-internal
-
-  worker2:
-    build:
-      context: ./worker
-    restart: unless-stopped
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      WORKER_NAME: worker2
-      INPUT_QUEUE: stage2
-      OUTPUT_QUEUE: stage3
-      PROGRESS_QUEUE: progress
-      REPORT_QUEUE: orchestrator_reports
-    networks:
-      - relay-internal
-
-  worker3:
-    build:
-      context: ./worker
-    restart: unless-stopped
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      WORKER_NAME: worker3
-      INPUT_QUEUE: stage3
-      OUTPUT_QUEUE: ""
-      PROGRESS_QUEUE: progress
-      REPORT_QUEUE: orchestrator_reports
-    networks:
-      - relay-internal
-
 networks:
-  relay-internal:
+  app-internal:
     driver: bridge
     internal: true
   dokploy-network:
