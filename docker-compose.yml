@@ -3,6 +3,12 @@ services:
     image: rabbitmq:3.13-alpine
     hostname: rabbitmq
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
     networks:
       - relay-internal
 
@@ -11,7 +17,8 @@ services:
       context: ./orchestrator
     restart: unless-stopped
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       START_QUEUE: stage1
@@ -28,7 +35,8 @@ services:
       context: ./worker
     restart: unless-stopped
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       WORKER_NAME: worker1
@@ -44,7 +52,8 @@ services:
       context: ./worker
     restart: unless-stopped
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       WORKER_NAME: worker2
@@ -60,7 +69,8 @@ services:
       context: ./worker
     restart: unless-stopped
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       WORKER_NAME: worker3
