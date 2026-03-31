@@ -1,0 +1,79 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    hostname: rabbitmq
+    restart: unless-stopped
+    networks:
+      - relay-internal
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+    restart: unless-stopped
+    depends_on:
+      - rabbitmq
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      START_QUEUE: stage1
+      PROGRESS_QUEUE: progress
+      REPORT_QUEUE: orchestrator_reports
+    ports:
+      - "8080:8080"
+    networks:
+      - relay-internal
+      - dokploy-network
+
+  worker1:
+    build:
+      context: ./worker
+    restart: unless-stopped
+    depends_on:
+      - rabbitmq
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WORKER_NAME: worker1
+      INPUT_QUEUE: stage1
+      OUTPUT_QUEUE: stage2
+      PROGRESS_QUEUE: progress
+      REPORT_QUEUE: orchestrator_reports
+    networks:
+      - relay-internal
+
+  worker2:
+    build:
+      context: ./worker
+    restart: unless-stopped
+    depends_on:
+      - rabbitmq
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WORKER_NAME: worker2
+      INPUT_QUEUE: stage2
+      OUTPUT_QUEUE: stage3
+      PROGRESS_QUEUE: progress
+      REPORT_QUEUE: orchestrator_reports
+    networks:
+      - relay-internal
+
+  worker3:
+    build:
+      context: ./worker
+    restart: unless-stopped
+    depends_on:
+      - rabbitmq
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WORKER_NAME: worker3
+      INPUT_QUEUE: stage3
+      OUTPUT_QUEUE: ""
+      PROGRESS_QUEUE: progress
+      REPORT_QUEUE: orchestrator_reports
+    networks:
+      - relay-internal
+
+networks:
+  relay-internal:
+    driver: bridge
+    internal: true
+  dokploy-network:
+    external: true
