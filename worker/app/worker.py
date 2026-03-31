@@ -52,11 +52,25 @@ async def main() -> None:
 
     queue = await channel.declare_queue(INPUT_QUEUE, durable=True)
     print(f"{WORKER_NAME}: consuming from {INPUT_QUEUE} as {hostname}")
+    await publish(
+        channel,
+        PROGRESS_QUEUE,
+        {
+            "type": "worker_ready",
+            "trace_id": f"{WORKER_NAME}-ready",
+            "worker": WORKER_NAME,
+            "hostname": hostname,
+            "timestamp": utc_now(),
+            "path": [],
+            "message": f"{WORKER_NAME} is connected to RabbitMQ and waiting on {INPUT_QUEUE}.",
+        },
+    )
 
     async with queue.iterator() as queue_iter:
         async for incoming in queue_iter:
             async with incoming.process():
                 payload = json.loads(incoming.body.decode())
+                print(f"{WORKER_NAME}: received trace {payload.get('trace_id')} from {INPUT_QUEUE}")
                 payload.setdefault("path", [])
                 payload["path"].append(hostname)
                 payload["last_worker"] = WORKER_NAME

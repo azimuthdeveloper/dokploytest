@@ -26,6 +26,7 @@ class RunStore:
     def __init__(self) -> None:
         self._runs: dict[str, dict[str, Any]] = {}
         self._recent_events: deque[dict[str, Any]] = deque(maxlen=100)
+        self._worker_statuses: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def register_start(self, trace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -51,8 +52,19 @@ class RunStore:
             return event
 
     async def record_progress(self, event: dict[str, Any]) -> None:
-        trace_id = event["trace_id"]
         async with self._lock:
+            if event["type"] == "worker_ready":
+                self._worker_statuses[event["worker"]] = {
+                    "worker": event["worker"],
+                    "hostname": event["hostname"],
+                    "timestamp": event["timestamp"],
+                    "status": "ready",
+                    "queue_message": event["message"],
+                }
+                self._recent_events.appendleft(event)
+                return
+
+            trace_id = event["trace_id"]
             run = self._runs.setdefault(
                 trace_id,
                 {
@@ -108,7 +120,12 @@ class RunStore:
             return {
                 "runs": runs,
                 "events": list(self._recent_events),
+                "workers": sorted(self._worker_statuses.values(), key=lambda item: item["worker"]),
             }
+
+    async def ready_workers(self) -> set[str]:
+        async with self._lock:
+            return set(self._worker_statuses.keys())
 
 
 class WebSocketHub:
@@ -406,9 +423,17 @@ async def index() -> str:
             <span>External Network</span>
             <strong>dokploy-network</strong>
           </article>
+          <article class="metric">
+            <span>Workers Ready</span>
+            <strong id="worker-count">0 / 3</strong>
+          </article>
         </div>
       </section>
       <section class="content">
+        <section class="panel">
+          <h2>Worker Status</h2>
+          <div id="workers" class="run-list"></div>
+        </section>
         <section class="panel">
           <h2>Runs</h2>
           <div id="runs" class="run-list"></div>
@@ -420,11 +445,13 @@ async def index() -> str:
       </section>
     </main>
     <script>
+      const workersEl = document.getElementById("workers");
       const runsEl = document.getElementById("runs");
       const eventsEl = document.getElementById("events");
       const startButton = document.getElementById("start-run");
+      const workerCountEl = document.getElementById("worker-count");
 
-      const state = { runs: [], events: [] };
+      const state = { runs: [], events: [], workers: [] };
       let pingTimer = null;
 
       function fmt(ts) {
@@ -438,6 +465,28 @@ async def index() -> str:
           .replaceAll(">", "&gt;")
           .replaceAll('"', "&quot;")
           .replaceAll("'", "&#39;");
+      }
+
+      function renderWorkers() {
+        workerCountEl.textContent = `${state.workers.length} / 3`;
+        startButton.disabled = state.workers.length < 3;
+        if (!state.workers.length) {
+          workersEl.innerHTML = '<div class="placeholder">No workers have announced readiness yet.</div>';
+          return;
+        }
+        workersEl.innerHTML = state.workers.map((worker) => `
+          <article class="run-card">
+            <div class="run-header">
+              <div>
+                <strong>${escapeHtml(worker.worker)}</strong>
+                <p>${escapeHtml(worker.queue_message)}</p>
+              </div>
+              <span class="pill">${escapeHtml(worker.status)}</span>
+            </div>
+            <p><code>${escapeHtml(worker.hostname)}</code></p>
+            <p>Ready at ${fmt(worker.timestamp)}</p>
+          </article>
+        `).join("");
       }
 
       function renderRuns() {
@@ -503,11 +552,33 @@ async def index() -> str:
       function applySnapshot(snapshot) {
         state.runs = snapshot.runs || [];
         state.events = snapshot.events || [];
+        state.workers = snapshot.workers || [];
+        renderWorkers();
         renderRuns();
         renderEvents();
       }
 
       function upsertRunFromEvent(event) {
+        if (event.type === "worker_ready") {
+          const existingWorker = state.workers.find((worker) => worker.worker === event.worker);
+          if (existingWorker) {
+            existingWorker.hostname = event.hostname;
+            existingWorker.timestamp = event.timestamp;
+            existingWorker.status = "ready";
+            existingWorker.queue_message = event.message;
+          } else {
+            state.workers.push({
+              worker: event.worker,
+              hostname: event.hostname,
+              timestamp: event.timestamp,
+              status: "ready",
+              queue_message: event.message,
+            });
+            state.workers.sort((a, b) => a.worker.localeCompare(b.worker));
+          }
+          return;
+        }
+
         const existing = state.runs.find((run) => run.trace_id === event.trace_id);
         if (!existing) {
           state.runs.unshift({
@@ -548,12 +619,20 @@ async def index() -> str:
       }
 
       async function startRun() {
+        if (state.workers.length < 3) {
+          return;
+        }
         startButton.disabled = true;
         try {
-          await fetch("/api/start", { method: "POST" });
+          const response = await fetch("/api/start", { method: "POST" });
+          if (!response.ok) {
+            const payload = await response.json();
+            const missing = (payload.missing_workers || []).join(", ");
+            window.alert(`Workers not ready: ${missing}`);
+          }
         } finally {
           window.setTimeout(() => {
-            startButton.disabled = false;
+            startButton.disabled = state.workers.length < 3;
           }, 500);
         }
       }
@@ -581,6 +660,7 @@ async def index() -> str:
             state.events.unshift(data.event);
             state.events = state.events.slice(0, 100);
             upsertRunFromEvent(data.event);
+            renderWorkers();
             renderRuns();
             renderEvents();
           }
@@ -597,11 +677,9 @@ async def index() -> str:
       startButton.addEventListener("click", startRun);
 
       loadSnapshot().then(() => {
+        renderWorkers();
         renderRuns();
         renderEvents();
-        if (!state.runs.length) {
-          startRun();
-        }
       });
       connect();
     </script>
@@ -617,6 +695,18 @@ async def get_state() -> JSONResponse:
 
 @app.post("/api/start")
 async def start_run() -> JSONResponse:
+    expected_workers = {"worker1", "worker2", "worker3"}
+    ready_workers = await store.ready_workers()
+    missing_workers = sorted(expected_workers - ready_workers)
+    if missing_workers:
+        return JSONResponse(
+            {
+                "status": "waiting_for_workers",
+                "missing_workers": missing_workers,
+            },
+            status_code=409,
+        )
+
     trace_id = uuid4().hex[:12]
     payload = {
         "trace_id": trace_id,
